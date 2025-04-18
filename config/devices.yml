@@ -63,7 +63,7 @@ devices:
   #         method: GET
   #         critical: true
 
-- name: prismon-monitor
+  - name: prismon-monitor
     type: media_monitor
     description: "Prismon media monitor"
     api:
