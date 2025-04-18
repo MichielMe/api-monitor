@@ -1,0 +1,66 @@
+# Device monitoring for {{device.name}}
+# Generated automatically - DO NOT EDIT MANUALLY
+
+{% if auth_failed %}
+# Authentication failed for this device: {{auth_error}}
+# Using minimal monitoring configuration
+
+[[inputs.http_response]]
+  urls = ["{{device.api.base_url}}/health"]
+  method = "GET"
+  response_timeout = "10s"
+  name_override = "device_auth_failed"
+  follow_redirects = true
+  
+  [inputs.http_response.tags]
+    device = "{{device.name}}"
+    device_name = "{{device.name}}"
+    device_type = "{{device.type}}"
+    status = "auth_failed"
+    error = "{{auth_error}}"
+
+{% else %}
+# Simple device health check
+[[inputs.http_response]]
+  urls = ["{{device.api.base_url}}/health"]
+  method = "GET"
+  response_timeout = "10s"
+  name_override = "device_health"
+  follow_redirects = true
+  
+  [inputs.http_response.tags]
+    device = "{{device.name}}"
+    device_name = "{{device.name}}"
+    device_type = "{{device.type}}"
+
+{% if device.type == "web_application" and device.api.metrics_type is defined and device.api.metrics_type == 'prometheus' %}
+# Prometheus metrics scraper 
+[[inputs.prometheus]]
+  urls = ["{{device.api.base_url}}{{device.api.metrics_path|default('/metrics')}}"]
+  response_timeout = "10s"
+  
+  {% if device.api.auth_type == 'basic' %}
+  username = "{{device.api.username}}"
+  password = "{{device.api.password}}"
+  {% elif device.api.auth_type == 'bearer' %}
+  bearer_token = "{{device.api.token}}"
+  {% endif %}
+
+  [inputs.prometheus.tags]
+    device = "{{device.name}}"
+    device_name = "{{device.name}}"
+    device_type = "{{device.type}}"
+{% endif %}
+
+# Prometheus output is handled in the main telegraf.conf to avoid conflicts
+# No outputs section here, as it would conflict with the main config
+
+# Optional: Send data to InfluxDB for historical storage
+{% if global is defined and global.influxdb_url is defined %}
+[[outputs.influxdb]]
+  urls = ["{{global.influxdb_url}}"]
+  database = "{{global.influxdb_database|default('telegraf')}}"
+  username = "{{global.influxdb_user|default('')}}"
+  password = "{{global.influxdb_password|default('')}}"
+{% endif %}
+{% endif %}

@@ -1,0 +1,104 @@
+services:
+  # API Monitor application
+  api-monitor:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    volumes:
+      - ./config:/config
+      # - ./app:/app
+    environment:
+      - CONFIG_PATH=/config/devices.yml
+      # Define all device authentication credentials in .env file instead of here
+    env_file:
+      - .env
+    ports:
+      - "8002:8000"
+    depends_on:
+      - prometheus
+      - grafana
+    restart: unless-stopped
+    networks:
+      - monitor-network
+
+  # Telegraf for API polling
+  telegraf:
+    image: telegraf:latest
+    volumes:
+      - ./config/telegraf/:/etc/telegraf/ # Mount entire directory
+      - /var/run/docker.sock:/var/run/docker.sock:ro # For Docker monitoring
+    command: telegraf --config-directory /etc/telegraf
+    ports:
+      - "9273:9273" # Expose the Prometheus endpoint
+    depends_on:
+      - prometheus
+      - api-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TELEGRAF_DEBUG=true # Enable debug logging to see all details
+    networks:
+      - monitor-network
+
+  # Init container to create required directories
+  init:
+    image: busybox
+    volumes:
+      - ./config:/config
+    command: >
+      sh -c "mkdir -p /config/telegraf /config/prometheus /config/grafana/provisioning/dashboards && 
+             touch /config/telegraf/auth_tokens.env &&
+             echo 'Initialized config directories and files' &&
+             chmod -R 777 /config"
+    restart: "no"
+
+  # Prometheus for metrics storage
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./config/prometheus/:/etc/prometheus/
+      - prometheus_data:/prometheus
+    env_file:
+      - .env
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - init
+    networks:
+      - monitor-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+      - init
+    restart: unless-stopped
+    networks:
+      - monitor-network
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitor-network:
+    driver: bridge

@@ -1,0 +1,2273 @@
+---
+description: 
+globs: *.py,*.toml,*uv*
+alwaysApply: false
+---
+---
+description: 
+globs: *.py,*.yml,*.toml,*uv*
+alwaysApply: false
+---
+# FastAPI Backend Project Guidelines
+
+## Table of Contents
+- [Introduction](mdc:#introduction)
+- [Modern FastAPI Architecture](mdc:#modern-fastapi-architecture)
+  - [Router Organization and Endpoint Design](mdc:#router-organization-and-endpoint-design)
+  - [Dependency Injection Patterns](mdc:#dependency-injection-patterns)
+  - [Middleware Implementation](mdc:#middleware-implementation)
+  - [Authentication and Authorization](mdc:#authentication-and-authorization)
+  - [Async/Await Best Practices](mdc:#asyncawait-best-practices)
+  - [Error Handling](mdc:#error-handling)
+  - [Request Validation](mdc:#request-validation)
+- [SQLAlchemy ORM Integration](mdc:#sqlalchemy-orm-integration)
+  - [Models Definition and Relationships](mdc:#models-definition-and-relationships)
+  - [Migration Management](mdc:#migration-management)
+  - [Query Optimization](mdc:#query-optimization)
+  - [Transaction Handling](mdc:#transaction-handling)
+  - [Connection Pooling](mdc:#connection-pooling)
+- [Project Structure](mdc:#project-structure)
+- [UV Package Management](mdc:#uv-package-management)
+  - [Dependencies Management](mdc:#dependencies-management)
+  - [Virtual Environment Setup](mdc:#virtual-environment-setup)
+  - [Package Pinning Strategies](mdc:#package-pinning-strategies)
+  - [Development vs Production Dependencies](mdc:#development-vs-production-dependencies)
+- [Docker Configuration](mdc:#docker-configuration)
+  - [Multi-stage Builds](mdc:#multi-stage-builds)
+  - [Environment Variable Management](mdc:#environment-variable-management)
+  - [Volume Mounting](mdc:#volume-mounting)
+  - [Service Networking](mdc:#service-networking)
+  - [Development vs Production Configurations](mdc:#development-vs-production-configurations)
+  - [Health Checks](mdc:#health-checks)
+- [Code Quality Standards](mdc:#code-quality-standards)
+  - [Type Hinting and Mypy](mdc:#type-hinting-and-mypy)
+  - [Testing Strategies](mdc:#testing-strategies)
+  - [Documentation Standards](mdc:#documentation-standards)
+  - [Logging Best Practices](mdc:#logging-best-practices)
+  - [Security Considerations](mdc:#security-considerations)
+- [Conclusion](mdc:#conclusion)
+
+## Introduction
+
+This document outlines best practices for developing scalable, maintainable FastAPI backend applications using modern tools including UV package manager, SQLAlchemy ORM, Docker, and robust code quality standards. These guidelines are designed to enhance development efficiency, application performance, and code maintainability.
+
+## Modern FastAPI Architecture
+
+### Router Organization and Endpoint Design
+
+#### Router Organization
+
+```python
+# app/api/routes/__init__.py
+from fastapi import APIRouter
+from .users import router as users_router
+from .items import router as items_router
+
+api_router = APIRouter()
+api_router.include_router(users_router, prefix="/users", tags=["users"])
+api_router.include_router(items_router, prefix="/items", tags=["items"])
+```
+
+```python
+# app/api/routes/users.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.schemas.user import UserCreate, UserResponse
+from app.services.user import UserService
+
+router = APIRouter()
+
+@router.post("/", response_model=UserResponse, status_code=201)
+async def create_user(
+    user_data: UserCreate,
+    user_service: UserService = Depends()
+):
+    return await user_service.create(user_data)
+```
+
+#### Endpoint Design Principles
+
+1. **Resource-oriented URLs**: Use nouns for resources: `/users`, `/items`, not verbs.
+2. **Proper HTTP methods**:
+   - GET: Retrieve resources
+   - POST: Create resources
+   - PUT: Update resources (complete replacement)
+   - PATCH: Partial updates
+   - DELETE: Remove resources
+3. **Consistent response structures**:
+   - Use Pydantic models for response schemas
+   - Include appropriate status codes
+   - Include pagination for list endpoints
+
+```python
+# app/schemas/common.py
+from typing import Generic, TypeVar, List, Optional
+from pydantic import BaseModel
+
+T = TypeVar('T')
+
+class PaginationParams(BaseModel):
+    page: int = 1
+    limit: int = 10
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: List[T]
+    total: int
+    page: int
+    limit: int
+    pages: int
+```
+
+### Dependency Injection Patterns
+
+#### Service-based Dependencies
+
+```python
+# app/deps.py
+from typing import Generator, Annotated
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import get_db
+from app.services.user import UserService
+from app.services.auth import AuthService
+
+# Database dependency
+async def get_db_session() -> Generator[AsyncSession, None, None]:
+    async with get_db() as session:
+        yield session
+
+DBSession = Annotated[AsyncSession, Depends(get_db_session)]
+
+# Service dependencies
+def get_user_service(db: DBSession) -> UserService:
+    return UserService(db)
+
+def get_auth_service(db: DBSession) -> AuthService:
+    return AuthService(db)
+
+# Shorthand typed dependencies
+UserServiceDep = Annotated[UserService, Depends(get_user_service)]
+AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+```
+
+#### Current User Dependency
+
+```python
+# app/deps.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from app.services.auth import AuthService
+from app.models.user import User
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    auth_service: AuthService = Depends(get_auth_service)
+) -> User:
+    user = await auth_service.validate_token(token)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+# Access control dependency
+async def get_current_active_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions"
+        )
+    return current_user
+```
+
+### Middleware Implementation
+
+```python
+# app/middleware/logging.py
+from fastapi import Request
+import time
+import logging
+from typing import Callable
+import uuid
+
+logger = logging.getLogger(__name__)
+
+async def logging_middleware(request: Request, call_next: Callable):
+    request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
+    
+    start_time = time.time()
+    logger.info(f"Request started: {request.method} {request.url.path} (ID: {request_id})")
+    
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        response.headers["X-Process-Time"] = str(process_time)
+        response.headers["X-Request-ID"] = request_id
+        
+        logger.info(
+            f"Request completed: {request.method} {request.url.path} "
+            f"(ID: {request_id}) Status: {response.status_code} "
+            f"Time: {process_time:.3f}s"
+        )
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(
+            f"Request failed: {request.method} {request.url.path} "
+            f"(ID: {request_id}) Error: {str(e)} "
+            f"Time: {process_time:.3f}s"
+        )
+        raise
+```
+
+```python
+# main.py
+from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
+from app.middleware.logging import logging_middleware
+
+app = FastAPI()
+app.add_middleware(BaseHTTPMiddleware, dispatch=logging_middleware)
+```
+
+#### Other Useful Middlewares
+
+```python
+# app/middleware/cors.py
+from fastapi.middleware.cors import CORSMiddleware
+
+def setup_cors(app: FastAPI) -> None:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"] if app.debug else [
+            "https://frontend.example.com",
+            "https://api.example.com"
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+```
+
+### Authentication and Authorization
+
+#### JWT Authentication
+
+```python
+# app/core/security.py
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from app.core.config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expires_delta = expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(
+        to_encode, 
+        settings.SECRET_KEY, 
+        algorithm=settings.ALGORITHM
+    )
+    return encoded_jwt
+
+def decode_token(token: str) -> Optional[dict]:
+    try:
+        return jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=[settings.ALGORITHM]
+        )
+    except JWTError:
+        return None
+```
+
+```python
+# app/services/auth.py
+from datetime import timedelta
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException, status
+from app.core.security import verify_password, create_access_token
+from app.models.user import User
+from app.schemas.auth import TokenData, Token
+from app.core.config import settings
+
+class AuthService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def authenticate_user(self, username: str, password: str) -> Optional[User]:
+        user = await self.db.execute(
+            select(User).where(User.username == username)
+        )
+        user = user.scalar_one_or_none()
+        
+        if not user or not verify_password(password, user.hashed_password):
+            return None
+        
+        return user
+    
+    async def create_access_token(self, user: User) -> Token:
+        token_data = {"sub": user.username, "user_id": user.id}
+        expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+        access_token = create_access_token(
+            data=token_data, 
+            expires_delta=expires_delta
+        )
+        
+        return Token(access_token=access_token, token_type="bearer")
+    
+    async def validate_token(self, token: str) -> Optional[User]:
+        payload = decode_token(token)
+        if payload is None:
+            return None
+            
+        username = payload.get("sub")
+        if username is None:
+            return None
+            
+        user = await self.db.execute(
+            select(User).where(User.username == username)
+        )
+        return user.scalar_one_or_none()
+```
+
+#### Role-Based Access Control
+
+```python
+# app/core/permissions.py
+from enum import Enum
+from typing import List, Optional
+from fastapi import Depends, HTTPException, status
+from app.models.user import User
+from app.deps import get_current_user
+
+class Role(str, Enum):
+    ADMIN = "admin"
+    EDITOR = "editor"
+    VIEWER = "viewer"
+
+def has_role(required_roles: List[Role]):
+    async def role_checker(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in required_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Action requires one of these roles: {', '.join([r.value for r in required_roles])}"
+            )
+        return current_user
+    return role_checker
+```
+
+Usage example:
+
+```python
+@router.delete("/{item_id}", status_code=204)
+async def delete_item(
+    item_id: int,
+    _: User = Depends(has_role([Role.ADMIN])),  # Only admins can delete
+    item_service: ItemServiceDep = Depends()
+):
+    await item_service.delete(item_id)
+    return None
+```
+
+### Async/Await Best Practices
+
+1. **Use async functions consistently**:
+
+```python
+# Good practice
+@router.get("/{item_id}")
+async def get_item(item_id: int, item_service: ItemServiceDep):
+    return await item_service.get(item_id)
+
+# Avoid mixing async and sync without reason
+@router.get("/")  # Bad practice
+def get_items(item_service: ItemServiceDep):
+    return item_service.get_all()  # Sync call to an async service
+```
+
+2. **Use async context managers for resources**:
+
+```python
+# Good practice
+async def get_db() -> AsyncGenerator:
+    async with async_sessionmaker() as session:
+        yield session
+
+# Bad practice
+def get_sync_db() -> Generator:
+    session = Session()
+    try:
+        yield session
+    finally:
+        session.close()
+```
+
+3. **Use efficient async I/O operations**:
+
+```python
+# Good practice
+async def fetch_multiple_resources(ids: List[int]) -> List[dict]:
+    # Gather multiple async operations
+    tasks = [fetch_resource(id) for id in ids]
+    return await asyncio.gather(*tasks)
+
+# Bad practice
+async def fetch_multiple_sequential(ids: List[int]) -> List[dict]:
+    results = []
+    for id in ids:
+        # Sequential async operations are inefficient
+        result = await fetch_resource(id)
+        results.append(result)
+    return results
+```
+
+4. **Don't block the event loop with CPU-intensive tasks**:
+
+```python
+# Good practice for CPU-intensive operations
+from concurrent.futures import ProcessPoolExecutor
+import asyncio
+
+process_pool = ProcessPoolExecutor()
+
+async def process_data(data: bytes) -> dict:
+    # Offload CPU-intensive work to a process pool
+    return await asyncio.get_event_loop().run_in_executor(
+        process_pool, 
+        cpu_intensive_function,
+        data
+    )
+```
+
+### Error Handling
+
+#### Custom Exception Handlers
+
+```python
+# app/core/errors.py
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import SQLAlchemyError
+from app.schemas.common import ErrorResponse
+import logging
+
+logger = logging.getLogger(__name__)
+
+class AppException(Exception):
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        error_code: str = None
+    ):
+        self.status_code = status_code
+        self.detail = detail
+        self.error_code = error_code
+
+def setup_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AppException)
+    async def app_exception_handler(request: Request, exc: AppException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=ErrorResponse(
+                error=exc.error_code or "app_error",
+                message=exc.detail
+            ).model_dump(),
+        )
+    
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        errors = exc.errors()
+        logger.warning(f"Validation error: {errors}")
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=ErrorResponse(
+                error="validation_error",
+                message="Validation error",
+                details=errors
+            ).model_dump(),
+        )
+        
+    @app.exception_handler(SQLAlchemyError)
+    async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+        logger.error(f"Database error: {str(exc)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=ErrorResponse(
+                error="database_error",
+                message="A database error occurred"
+            ).model_dump(),
+        )
+        
+    @app.exception_handler(Exception)
+    async def general_exception_handler(request: Request, exc: Exception):
+        logger.exception(f"Unhandled exception: {str(exc)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=ErrorResponse(
+                error="server_error",
+                message="An unexpected error occurred"
+            ).model_dump(),
+        )
+```
+
+#### Custom Domain Exceptions
+
+```python
+# app/core/exceptions.py
+from fastapi import status
+from app.core.errors import AppException
+
+class ItemNotFound(AppException):
+    def __init__(self, item_id: int):
+        super().__init__(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with id {item_id} not found",
+            error_code="item_not_found"
+        )
+
+class UserAlreadyExists(AppException):
+    def __init__(self, username: str):
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"User with username {username} already exists",
+            error_code="user_already_exists"
+        )
+        
+class InsufficientPermissions(AppException):
+    def __init__(self, action: str):
+        super().__init__(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"You don't have permission to {action}",
+            error_code="insufficient_permissions"
+        )
+```
+
+### Request Validation
+
+#### Pydantic Models with Validation
+
+```python
+# app/schemas/user.py
+from pydantic import BaseModel, EmailStr, Field, validator
+import re
+from typing import Optional
+
+class UserBase(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    email: EmailStr
+    full_name: Optional[str] = Field(None, max_length=100)
+
+class UserCreate(UserBase):
+    password: str = Field(..., min_length=8, max_length=100)
+    
+    @validator('password')
+    def password_strength(cls, v):
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('Password must contain at least one number')
+        return v
+        
+    @validator('username')
+    def username_alphanumeric(cls, v):
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('Username must be alphanumeric with - and _ allowed')
+        return v
+
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = Field(None, max_length=100)
+    password: Optional[str] = Field(None, min_length=8, max_length=100)
+    
+    @validator('password')
+    def password_strength(cls, v):
+        if v is None:
+            return v
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search(r'[0-9]', v):
+            raise ValueError('Password must contain at least one number')
+        return v
+
+class UserResponse(UserBase):
+    id: int
+    is_active: bool
+    
+    class Config:
+        from_attributes = True
+```
+
+#### Path Parameter Validation
+
+```python
+# app/api/routes/items.py
+from fastapi import Path
+
+@router.get("/{item_id}")
+async def get_item(
+    item_id: int = Path(..., ge=1, description="The ID of the item to get"),
+    item_service: ItemServiceDep = Depends()
+):
+    return await item_service.get(item_id)
+```
+
+#### Query Parameter Validation
+
+```python
+# app/api/routes/items.py
+from fastapi import Query
+from typing import Optional, List
+
+@router.get("/")
+async def list_items(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    sort_by: Optional[str] = Query(None, description="Field to sort by"),
+    sort_order: Optional[str] = Query(None, description="Sort order (asc or desc)"),
+    categories: Optional[List[str]] = Query(None, description="Filter by categories"),
+    item_service: ItemServiceDep = Depends()
+):
+    return await item_service.list(
+        page=page,
+        limit=limit,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        filters={"categories": categories} if categories else None
+    )
+```
+
+## SQLAlchemy ORM Integration
+
+### Models Definition and Relationships
+
+#### Base Model Setup
+
+```python
+# app/models/base.py
+from sqlalchemy import Column, Integer, DateTime, func
+from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from datetime import datetime
+from typing import Any
+
+class Base(DeclarativeBase):
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=func.now(), 
+        onupdate=func.now(), 
+        nullable=False
+    )
+
+    @declared_attr
+    def __tablename__(cls) -> str:
+        return cls.__name__.lower()
+```
+
+#### Model with Relationships
+
+```python
+# app/models/user.py
+from sqlalchemy import String, Boolean, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import List, Optional
+from app.models.base import Base
+from app.models.item import Item
+
+class User(Base):
+    username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    email: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    hashed_password: Mapped[str] = mapped_column(String(100))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # One-to-many relationship
+    items: Mapped[List["Item"]] = relationship(
+        "Item", 
+        back_populates="owner", 
+        cascade="all, delete-orphan"
+    )
+
+# app/models/item.py
+from sqlalchemy import String, ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import Optional
+from app.models.base import Base
+
+class Item(Base):
+    title: Mapped[str] = mapped_column(String(100), index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Many-to-one relationship
+    owner_id: Mapped[int] = mapped_column(ForeignKey("user.id"))
+    owner: Mapped["User"] = relationship("User", back_populates="items")
+
+# app/models/tag.py - Example of many-to-many relationship
+from sqlalchemy import Table, Column, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import List
+from app.models.base import Base
+
+# Association table for many-to-many relationship
+item_tag = Table(
+    "item_tag",
+    Base.metadata,
+    Column("item_id", ForeignKey("item.id"), primary_key=True),
+    Column("tag_id", ForeignKey("tag.id"), primary_key=True),
+)
+
+class Tag(Base):
+    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    
+    # Many-to-many relationship
+    items: Mapped[List["Item"]] = relationship(
+        "Item", 
+        secondary=item_tag,
+        back_populates="tags"
+    )
+
+# Update Item model to include tags
+class Item(Base):
+    # ... existing code ...
+    
+    # Many-to-many relationship
+    tags: Mapped[List["Tag"]] = relationship(
+        "Tag", 
+        secondary=item_tag,
+        back_populates="items"
+    )
+```
+
+
+### Query Optimization
+
+#### Efficient Querying
+
+```python
+# app/services/item.py
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload, contains_eager
+from app.models.item import Item
+from app.models.tag import Tag
+from app.schemas.item import ItemCreate, ItemUpdate
+from typing import List, Optional, Dict, Any
+
+class ItemService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def get(self, item_id: int) -> Optional[Item]:
+        # Use selectinload to eagerly load related tags
+        query = select(Item).where(Item.id == item_id).options(
+            selectinload(Item.tags),
+            selectinload(Item.owner)
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+    
+    async def list(
+        self, 
+        page: int = 1, 
+        limit: int = 10,
+        sort_by: Optional[str] = None,
+        sort_order: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ):
+        # Calculate offset
+        offset = (page - 1) * limit
+        
+        # Start building the query
+        query = select(Item)
+        
+        # Apply filters
+        if filters:
+            if "categories" in filters and filters["categories"]:
+                query = query.join(Item.tags).where(
+                    Tag.name.in_(filters["categories"])
+                ).group_by(Item.id).having(
+                    func.count(Tag.id) == len(filters["categories"])
+                )
+            
+            if "owner_id" in filters:
+                query = query.where(Item.owner_id == filters["owner_id"])
+        
+        # Count total
+        count_query = select(func.count()).select_from(query.subquery())
+        total = await self.db.scalar(count_query)
+        
+        # Apply sorting
+        if sort_by:
+            column = getattr(Item, sort_by, Item.created_at)
+            if sort_order and sort_order.lower() == "desc":
+                column = column.desc()
+            query = query.order_by(column)
+        else:
+            # Default sort by creation date, newest first
+            query = query.order_by(Item.created_at.desc())
+        
+        # Apply pagination
+        query = query.limit(limit).offset(offset)
+        
+        # Load related data efficiently
+        query = query.options(
+            selectinload(Item.tags),
+            selectinload(Item.owner)
+        )
+        
+        # Execute query
+        items = await self.db.execute(query)
+        items = items.scalars().all()
+        
+        # Return paginated response
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": (total + limit - 1) // limit  # Ceiling division
+        }
+```
+
+#### Using Indexes Effectively
+
+```python
+# app/models/item.py
+from sqlalchemy import String, ForeignKey, Text, Index
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from typing import Optional
+from app.models.base import Base
+
+class Item(Base):
+    title: Mapped[str] = mapped_column(String(100), index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    
+    # Create a composite index for frequently queried combinations
+    __table_args__ = (
+        Index('idx_item_status_category', 'status', 'category'),
+    )
+    
+    # ... relationships ...
+```
+
+### Transaction Handling
+
+```python
+# app/services/order.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.order import Order
+from app.models.item import Item
+from app.models.payment import Payment
+from app.schemas.order import OrderCreate
+from app.core.exceptions import InsufficientInventory, PaymentFailed
+
+class OrderService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+    
+    async def create_order(self, order_data: OrderCreate, user_id: int) -> Order:
+        # Start transaction - will be committed by the caller (dependency)
+        
+        try:
+            # 1. Create the order
+            order = Order(
+                user_id=user_id,
+                total=order_data.total,
+                status="pending"
+            )
+            self.db.add(order)
+            await self.db.flush()  # Get the order ID
+            
+            # 2. Check and update inventory
+            for item_id, quantity in order_data.items.items():
+                item = await self.db.get(Item, item_id)
+                if item.stock < quantity:
+                    # Rollback will happen in the exception handler
+                    raise InsufficientInventory(item_id)
+                
+                # Update inventory
+                item.stock -= quantity
+                
+                # Create order item
+                order_item = OrderItem(
+                    order_id=order.id,
+                    item_id=item_id,
+                    quantity=quantity,
+                    price=item.price
+                )
+                self.db.add(order_item)
+            
+            # 3. Process payment
+            payment_result = await self.process_payment(order_data.payment)
+            if not payment_result.success:
+                raise PaymentFailed(payment_result.error)
+            
+            # 4. Record payment
+            payment = Payment(
+                order_id=order.id,
+                amount=order_data.total,
+                payment_id=payment_result.payment_id
+            )
+            self.db.add(payment)
+            
+            # 5. Update order status
+            order.status = "paid"
+            
+            return order
+            
+        except Exception:
+            # The transaction will be rolled back in the dependency
+            raise
+```
+
+```python
+# app/api/routes/orders.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.deps import get_db, get_current_user
+from app.schemas.order import OrderCreate, OrderResponse
+from app.services.order import OrderService
+from app.models.user import User
+from app.core.exceptions import InsufficientInventory, PaymentFailed
+
+router = APIRouter()
+
+@router.post("/", response_model=OrderResponse)
+async def create_order(
+    order_data: OrderCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Session is automatically committed if no exceptions occur
+    # and rolled back if an exception is raised
+    order_service = OrderService(db)
+    try:
+        order = await order_service.create_order(order_data, current_user.id)
+        return order
+    except InsufficientInventory as e:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Insufficient inventory for item {e.item_id}"
+        )
+    except PaymentFailed as e:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Payment failed: {e.error}"
+        )
+```
+
+### Connection Pooling
+
+```python
+# app/core/config.py
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    # Database settings
+    POSTGRES_USER: str
+    POSTGRES_PASSWORD: str
+    POSTGRES_DB: str
+    POSTGRES_HOST: str = "postgres"
+    POSTGRES_PORT: str = "5432"
+    
+    SQLALCHEMY_DATABASE_URI: Optional[str] = None
+    SQLALCHEMY_DATABASE_URI_SYNC: Optional[str] = None
+    
+    # Connection pool settings
+    DB_ECHO: bool = False
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT: int = 30
+    DB_POOL_RECYCLE: int = 1800
+    
+    @property
+    def SQLALCHEMY_DATABASE_URI(self) -> str:
+        """Get async database URI."""
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+    
+    @property
+    def SQLALCHEMY_DATABASE_URI_SYNC(self) -> str:
+        """Get sync database URI for Alembic."""
+        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+
+settings = Settings()
+```
+
+## Project Structure
+
+```
+app/
+├── api/                      # Route definitions
+│   ├── __init__.py           # Combines all routers
+│   └── routes/               # Route modules by resource
+│       ├── __init__.py
+│       ├── users.py
+│       ├── items.py
+│       └── auth.py
+├── core/                     # Core application code
+│   ├── __init__.py
+│   ├── config.py             # App configuration
+│   ├── db.py                 # Database setup
+│   ├── errors.py             # Error handling
+│   ├── exceptions.py         # Custom exceptions
+│   ├── logger.py             # Logging setup
+│   └── security.py           # Security utilities
+├── middleware/               # Custom middleware
+│   ├── __init__.py
+│   ├── logging.py
+│   └── auth.py
+├── models/                   # SQLAlchemy models
+│   ├── __init__.py
+│   ├── base.py               # Base model class
+│   ├── user.py
+│   └── item.py
+├── schemas/                  # Pydantic models
+│   ├── __init__.py
+│   ├── common.py             # Shared schemas
+│   ├── user.py
+│   └── item.py
+├── services/                 # Business logic
+│   ├── __init__.py
+│   ├── user.py
+│   └── item.py
+├── utils/                    # Helper functions
+│   ├── __init__.py
+│   ├── pagination.py
+│   └── validators.py
+├── __init__.py
+├── deps.py                   # Dependency injection
+└── main.py                   # Application entry point
+
+# Project root
+├── tests/                    # Test files
+│   ├── conftest.py
+│   ├── test_api/
+│   ├── test_services/
+│   └── test_utils/
+├── .env                      # Environment variables
+├── .env.example              # Example env file
+├── .gitignore
+├── .pre-commit-config.yaml   # Pre-commit hooks
+├── Dockerfile                # Docker build file
+├── pyproject.toml            # Project metadata and dependencies
+├── README.md                 # Project documentation
+└── uv.lock                   # UV lock file
+── docker-compose.yaml       # Docker compose config goes in the parent folder of the backend folder
+```
+
+## UV Package Management
+
+### Dependencies Management
+
+```toml
+# pyproject.toml
+[project]
+name = "fastapi-app"
+version = "0.1.0"
+description = "FastAPI application with UV"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]<1.0.0,>=0.114.2",
+    "uvicorn[standard]<1.0.0,>=0.27.0",
+    "python-multipart<1.0.0,>=0.0.7",
+    "email-validator<3.0.0,>=2.1.0",
+    "python-jose[cryptography]<4.0.0,>=3.3.0",
+    "passlib[bcrypt]<2.0.0,>=1.7.4",
+    "SQLAlchemy[asyncio]>=2.0.28,<3.0.0",
+    "alembic<2.0.0,>=1.12.1",
+    "asyncpg<1.0.0,>=0.29.0",
+    "pydantic[email]>=2.6.0,<3.0.0",
+    "pydantic-settings>=2.1.0,<3.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest<8.0.0,>=7.4.3",
+    "pytest-asyncio<1.0.0,>=0.23.5",
+    "httpx<1.0.0,>=0.27.0",
+    "mypy<2.0.0,>=1.8.0",
+    "ruff<1.0.0,>=0.2.2",
+    "pre-commit<4.1.0,>=4.0.0",
+    "black<24.0.0,>=23.12.0",
+]
+```
+
+### Virtual Environment Setup
+
+```bash
+# Initialize a new project
+uv init my-fastapi-app
+
+# Navigate to project directory
+cd my-fastapi-app
+
+# Set up virtual environment and install dependencies
+uv sync
+
+# Activate virtual environment for shell use
+source .venv/bin/activate  # Linux/Mac
+# or
+.venv\Scripts\activate  # Windows
+```
+
+### Package Pinning Strategies
+
+```toml
+# Conservative pinning (recommended for production)
+# Major version pinning with minimum version
+dependencies = [
+    "fastapi>=0.114.2,<1.0.0",
+    "SQLAlchemy>=2.0.28,<3.0.0",
+]
+
+# Precise pinning (useful for reproducible builds)
+dependencies = [
+    "fastapi==0.114.2",
+    "SQLAlchemy==2.0.28",
+]
+
+# Loose pinning (not recommended for production)
+dependencies = [
+    "fastapi>=0.114",
+    "SQLAlchemy>=2.0",
+]
+```
+
+### Development vs Production Dependencies
+
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+    # Core dependencies needed for both development and production
+    "fastapi[standard]<1.0.0,>=0.114.2",
+    "uvicorn[standard]<1.0.0,>=0.27.0",
+    # ... other production dependencies ...
+]
+
+[tool.uv]
+dev-dependencies = [
+    # Development-only dependencies
+    "pytest<8.0.0,>=7.4.3",
+    "pytest-asyncio<1.0.0,>=0.23.5",
+    "mypy<2.0.0,>=1.8.0",
+    "ruff<1.0.0,>=0.2.2",
+    "pre-commit<4.1.0,>=4.0.0",
+    "black<24.0.0,>=23.12.0",
+    "pytest-cov<5.0.0,>=4.1.0",
+]
+```
+
+## Docker Configuration
+
+### Multi-stage Builds
+
+```dockerfile
+# Dockerfile
+# Stage 1: Build stage
+FROM python:3.11-slim AS builder
+
+# Install UV 
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /bin/
+
+WORKDIR /app
+
+# Copy dependency files
+COPY pyproject.toml uv.lock .python-version ./
+
+# Install dependencies
+RUN uv pip install --system -r <(uv pip freeze --requirements-file pyproject.toml)
+
+# Stage 2: Runtime stage
+FROM python:3.11-slim AS runtime
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code
+COPY ./app /app/app
+COPY ./alembic /app/alembic
+COPY ./alembic.ini /app/
+COPY ./scripts /app/scripts
+
+# Run as non-root user for better security
+RUN addgroup --system app && \
+    adduser --system --ingroup app app && \
+    chown -R app:app /app
+USER app
+
+# Set script as entrypoint
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+
+# Default command (override in docker-compose)
+CMD ["fastapi", "dev", "app/main.py", "--host", "0.0.0.0"]
+```
+
+```bash
+# scripts/entrypoint.sh
+#!/bin/bash
+set -e
+
+
+# Execute passed command
+exec "$@"
+```
+
+### Environment Variable Management
+
+```yaml
+# docker-compose.yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG:-false}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    # ...
+```
+
+```python
+# app/core/config.py
+from pydantic_settings import BaseSettings
+from typing import Optional, Dict, Any, List
+from functools import lru_cache
+
+class Settings(BaseSettings):
+    # API settings
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "FastAPI App"
+    DEBUG: bool = False
+    ENVIRONMENT: str = "production"
+    
+    # Security settings
+    SECRET_KEY: str
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ALGORITHM: str = "HS256"
+    
+    # CORS settings
+    CORS_ORIGINS: List[str] = []
+    
+    # ... Database settings ...
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+@lru_cache
+def get_settings() -> Settings:
+    """Get cached settings instance."""
+    return Settings()
+
+settings = get_settings()
+```
+
+### Volume Mounting Best Practices
+
+```yaml
+# docker-compose.yaml
+services:
+  app:
+    # ...
+    volumes:
+      # Mount code for development
+      - ./app:/app/app:ro  # Read-only in production
+      # Named volume for persistent data
+      - app_data:/app/data
+    # ...
+  
+  # Database with persistent storage
+  postgres:
+    image: postgres:15
+    volumes:
+      # Named volume for database data
+      - postgres_data:/var/lib/postgresql/data
+      # Initialization scripts
+      - ./scripts/db:/docker-entrypoint-initdb.d:ro
+    # ...
+
+volumes:
+  app_data:
+  postgres_data:
+```
+
+### Service Networking
+
+```yaml
+# docker-compose.yaml
+services:
+  app:
+    # ...
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # ...
+  
+  postgres:
+    # ...
+    networks:
+      - backend
+    # ...
+  
+  redis:
+    # ...
+    networks:
+      - backend
+    # ...
+  
+  nginx:
+    # ...
+    networks:
+      - backend
+      - frontend
+    # ...
+
+networks:
+  backend:
+    internal: true  # Not accessible from outside
+  frontend:
+    # External access
+```
+
+### Development vs Production Configurations
+
+```yaml
+# docker-compose.yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ...
+
+# docker-compose.override.yaml (development overrides)
+services:
+  app:
+    build:
+      target: development
+    volumes:
+      - ./app:/app/app  # Mount for live code changes
+      - ./tests:/app/tests
+    environment:
+      - DEBUG=true
+      - ENVIRONMENT=development
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+    
+  postgres:
+    ports:
+      - "5432:5432"  # Expose ports in development
+```
+
+```yaml
+# docker-compose.prod.yaml
+services:
+  app:
+    build:
+      target: production
+    restart: always
+    deploy:
+      replicas: 3
+    environment:
+      - DEBUG=false
+      - ENVIRONMENT=production
+    command: gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000
+    
+  postgres:
+    # No exposed ports in production
+    volumes:
+      - /var/data/postgres:/var/lib/postgresql/data  # Use host path for persistence
+```
+
+### Health Checks Implementation
+
+```yaml
+# docker-compose.yaml
+services:
+  app:
+    # ...
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # ...
+  
+  postgres:
+    # ...
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # ...
+```
+
+```python
+# app/api/routes/health.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.deps import get_db
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check(db: AsyncSession = Depends(get_db)):
+    """
+    Health check endpoint that verifies:
+    - API is running
+    - Database connection is working
+    """
+    # Check database connection
+    try:
+        # Simple query to check DB connection
+        result = await db.execute("SELECT 1")
+        db_check = result.scalar() == 1
+    except Exception:
+        db_check = False
+    
+    # Build response
+    status = "healthy" if db_check else "unhealthy"
+    
+    return {
+        "status": status,
+        "checks": {
+            "api": "healthy",
+            "database": "healthy" if db_check else "unhealthy"
+        }
+    }
+```
+
+## Code Quality Standards
+
+### Type Hinting and Mypy
+
+```python
+# app/utils/pagination.py
+from typing import TypeVar, Generic, List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+
+T = TypeVar('T')
+
+class PaginationParams(BaseModel):
+    page: int = Field(1, ge=1, description="Page number")
+    limit: int = Field(10, ge=1, le=100, description="Items per page")
+    sort_by: Optional[str] = None
+    sort_order: Optional[str] = None
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    items: List[T]
+    total: int
+    page: int
+    limit: int
+    pages: int
+    
+    @classmethod
+    def create(
+        cls, 
+        items: List[T], 
+        total: int, 
+        params: PaginationParams
+    ) -> "PaginatedResponse[T]":
+        """Create a paginated response from items and pagination parameters."""
+        pages = (total + params.limit - 1) // params.limit if params.limit > 0 else 0
+        return cls(
+            items=items,
+            total=total,
+            page=params.page,
+            limit=params.limit,
+            pages=pages
+        )
+```
+
+```toml
+# mypy configuration in pyproject.toml
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+strict_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+```
+
+### Testing Strategies
+
+```python
+# tests/conftest.py
+import pytest
+import asyncio
+from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from typing import Generator, AsyncGenerator
+
+from app.main import app
+from app.core.config import settings
+from app.deps import get_db
+from app.models.base import Base
+
+# Create test database engine
+TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@postgres/test_db"
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for the test session."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest.fixture(scope="session")
+async def async_engine():
+    """Create a new async engine for the tests."""
+    engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    
+    yield engine
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    
+    await engine.dispose()
+
+@pytest.fixture
+async def async_session(async_engine) -> AsyncGenerator[AsyncSession, None]:
+    """Create a new async session for a test."""
+    async_session_maker = sessionmaker(
+        async_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    
+    async with async_session_maker() as session:
+        yield session
+        await session.rollback()
+
+@pytest.fixture
+async def client(async_session) -> Generator:
+    """Create a test client with a mock DB session."""
+    async def override_get_db():
+        yield async_session
+    
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+```
+
+#### API Tests
+
+```python
+# tests/api/test_users.py
+import pytest
+from fastapi.testclient import TestClient
+from app.core.security import get_password_hash
+from app.models.user import User
+
+pytestmark = pytest.mark.asyncio
+
+async def test_create_user(client: TestClient, async_session):
+    # Test data
+    user_data = {
+        "username": "testuser",
+        "email": "test@example.com",
+        "password": "Password123",
+        "full_name": "Test User"
+    }
+    
+    # Make request
+    response = client.post("/api/v1/users/", json=user_data)
+    
+    # Assertions
+    assert response.status_code == 201
+    data = response.json()
+    assert data["username"] == user_data["username"]
+    assert data["email"] == user_data["email"]
+    assert data["full_name"] == user_data["full_name"]
+    assert "id" in data
+    assert "password" not in data
+    
+    # Verify user in database
+    db_user = await async_session.get(User, data["id"])
+    assert db_user is not None
+    assert db_user.username == user_data["username"]
+    assert db_user.email == user_data["email"]
+    # Password should be hashed
+    assert db_user.hashed_password != user_data["password"]
+
+async def test_get_user(client: TestClient, async_session):
+    # Create test user in DB
+    user = User(
+        username="getuser",
+        email="get@example.com",
+        hashed_password=get_password_hash("Password123"),
+        full_name="Get User"
+    )
+    async_session.add(user)
+    await async_session.commit()
+    await async_session.refresh(user)
+    
+    # Make request
+    response = client.get(f"/api/v1/users/{user.id}")
+    
+    # Assertions
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == user.id
+    assert data["username"] == user.username
+    assert data["email"] == user.email
+    assert data["full_name"] == user.full_name
+```
+
+#### Service Tests
+
+```python
+# tests/services/test_user_service.py
+import pytest
+from app.services.user import UserService
+from app.schemas.user import UserCreate
+from app.models.user import User
+
+pytestmark = pytest.mark.asyncio
+
+async def test_create_user(async_session):
+    # Setup service
+    service = UserService(async_session)
+    
+    # Test data
+    user_data = UserCreate(
+        username="servicetest",
+        email="service@example.com",
+        password="Password123",
+        full_name="Service Test"
+    )
+    
+    # Call service
+    user = await service.create(user_data)
+    
+    # Assertions
+    assert user.username == user_data.username
+    assert user.email == user_data.email
+    assert user.full_name == user_data.full_name
+    assert user.hashed_password != user_data.password  # Password should be hashed
+    
+    # Verify in database
+    db_user = await async_session.get(User, user.id)
+    assert db_user is not None
+    assert db_user.username == user_data.username
+```
+
+### Documentation Standards
+
+```python
+# app/api/routes/users.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from app.services.user import UserService
+from app.schemas.user import UserCreate, UserResponse, UserUpdate
+from app.deps import get_user_service, get_current_user
+from typing import List
+
+router = APIRouter()
+
+@router.post("/", response_model=UserResponse, status_code=201)
+async def create_user(
+    user_data: UserCreate,
+    user_service: UserService = Depends(get_user_service)
+):
+    """
+    Create a new user in the system.
+    
+    - **username**: Required, must be unique, 3-50 characters
+    - **email**: Required, must be valid email format
+    - **password**: Required, 8-100 characters, must contain uppercase, lowercase, and numbers
+    - **full_name**: Optional, max 100 characters
+    
+    Returns the created user without the password.
+    """
+    return await user_service.create(user_data)
+
+@router.get("/{user_id}", response_model=UserResponse)
+async def get_user(
+    user_id: int,
+    user_service: UserService = Depends(get_user_service),
+    current_user = Depends(get_current_user)
+):
+    """
+    Retrieve a specific user by ID.
+    
+    Requires authentication. Users can retrieve their own information.
+    Admins can retrieve any user's information.
+    
+    Returns:
+    - User details without the password
+    
+    Raises:
+    - 404: User not found
+    - 403: Insufficient permissions to access the user
+    """
+    # Implementation...
+```
+
+#### OpenAPI Enhancement
+
+```python
+# main.py
+from fastapi import FastAPI
+from app.api.routes import api_router
+from app.core.config import settings
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="""
+    FastAPI backend application with comprehensive features.
+    
+    ## Users
+    
+    You can **create**, **read**, **update**, and **delete** users.
+    
+    ## Authentication
+    
+    JWT-based authentication system with token refresh.
+    
+    ## Items
+    
+    Resource management with advanced filtering and pagination.
+    """,
+    version="0.1.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    contact={
+        "name": "Development Team",
+        "email": "dev@example.com",
+    },
+    license_info={
+        "name": "MIT",
+    },
+)
+
+app.include_router(api_router, prefix=settings.API_V1_STR)
+```
+
+### Logging with Loguru
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+    # existing dependencies...
+    "loguru>=0.7.0,<1.0.0",
+]
+```
+
+## Implementation
+
+### Core Logger Module
+
+```python
+# app/core/logger.py
+import sys
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Optional, Union, Callable
+
+from loguru import logger
+from pydantic import BaseModel
+
+from app.core.config import settings
+
+
+class LoguruConfig(BaseModel):
+    """Loguru configuration settings"""
+    
+    # Log level
+    log_level: str = "INFO"
+    
+    # Log format type
+    json_format: bool = True
+    
+    # Log to console
+    console_log: bool = True
+    
+    # Log to file
+    file_log: bool = False
+    file_path: Optional[str] = "logs/app.log"
+    file_rotation: str = "10 MB"
+    file_retention: str = "1 month"
+    
+    # Log format functions
+    @staticmethod
+    def json_formatter(record: Dict[str, Any]) -> str:
+        """Format log records as JSON"""
+        log_record = {
+            "timestamp": record["time"].isoformat(),
+            "level": record["level"].name,
+            "message": record["message"],
+            "module": record["name"],
+            "function": record["function"],
+            "line": record["line"],
+            "process_id": record["process"].id,
+            "thread_name": record["thread"].name,
+        }
+        
+        # Include exception info if present
+        if record["exception"]:
+            log_record["exception"] = record["exception"]
+        
+        # Include extra attributes
+        if record["extra"]:
+            for key, value in record["extra"].items():
+                log_record[key] = value
+        
+        return json.dumps(log_record)
+    
+    @staticmethod
+    def standard_formatter(record: Dict[str, Any]) -> str:
+        """Format log records as standard text"""
+        return (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+            "{message}"
+        )
+    
+    def get_format_function(self) -> Callable:
+        """Return the appropriate format function based on settings"""
+        if self.json_format:
+            return self.json_formatter
+        return self.standard_formatter
+
+
+def setup_logging() -> None:
+    """Configure Loguru based on environment settings"""
+    # Create log config based on environment
+    log_config = LoguruConfig(
+        log_level="DEBUG" if settings.DEBUG else "INFO",
+        json_format=settings.ENVIRONMENT == "production",
+        file_log=settings.ENVIRONMENT == "production",
+        file_path=f"logs/{settings.ENVIRONMENT}/app.log",
+    )
+    
+    # Remove default logger
+    logger.remove()
+    
+    # Configure console logging
+    if log_config.console_log:
+        logger.add(
+            sys.stdout,
+            level=log_config.log_level,
+            format=log_config.get_format_function(),
+            serialize=log_config.json_format,
+            backtrace=True,
+            diagnose=True,
+            enqueue=True,
+        )
+    
+    # Configure file logging
+    if log_config.file_log:
+        # Ensure log directory exists
+        log_file = Path(log_config.file_path)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.add(
+            log_config.file_path,
+            level=log_config.log_level,
+            format=log_config.get_format_function(),
+            serialize=log_config.json_format,
+            rotation=log_config.file_rotation,
+            retention=log_config.file_retention,
+            compression="zip",
+            backtrace=True,
+            diagnose=True,
+            enqueue=True,
+        )
+    
+    # Configure specific loggers
+    # For SQL Alchemy - filter out verbose SQL logs in non-debug mode
+    if not settings.DEBUG:
+        from loguru._logger import Core
+        Core._min_level = max(Core._min_level, logger.level("WARNING").no)
+    
+    # Make logger available globally
+    return logger
+```
+
+#### Integration with FastAPI
+
+```python
+# app/main.py
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.api.routes import api_router
+from app.core.config import settings
+from app.core.logger import setup_logging
+
+# Setup logging first
+logger = setup_logging()
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="FastAPI application with Loguru logging",
+    version="0.1.0",
+)
+
+# Log application startup
+@app.on_event("startup")
+async def startup_event():
+    logger.info(
+        "Starting application",
+        environment=settings.ENVIRONMENT,
+        debug=settings.DEBUG,
+    )
+
+# Log application shutdown
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down application")
+```
+
+#### Request Logging Middleware
+
+```python
+# app/middleware/logging.py
+import time
+import uuid
+from fastapi import Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """Log all requests and responses"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Generate request ID
+        request_id = str(uuid.uuid4())
+        
+        # Add request ID to request state
+        request.state.request_id = request_id
+        
+        # Start timer
+        start_time = time.time()
+        
+        # Log request
+        from app.core.logger import logger
+        logger.info(
+            f"Request started: {request.method} {request.url.path}",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            client_host=request.client.host if request.client else None,
+        )
+        
+        try:
+            # Process request
+            response = await call_next(request)
+            
+            # Calculate process time
+            process_time = time.time() - start_time
+            
+            # Add headers
+            response.headers["X-Process-Time"] = str(process_time)
+            response.headers["X-Request-ID"] = request_id
+            
+            # Log response
+            logger.info(
+                f"Request completed: {request.method} {request.url.path}",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                process_time=process_time,
+            )
+            
+            return response
+            
+        except Exception as e:
+            # Calculate process time
+            process_time = time.time() - start_time
+            
+            # Log error
+            logger.error(
+                f"Request failed: {request.method} {request.url.path}",
+                request_id=request_id,
+                method=request.method,
+                path=request.url.path,
+                error=str(e),
+                process_time=process_time,
+                exc_info=True,  # Include exception traceback
+            )
+            
+            # Re-raise the exception
+            raise
+```
+
+#### Add the middleware to your app
+
+```python
+# app/main.py
+from app.middleware.logging import RequestLoggingMiddleware
+
+# Add middleware
+app.add_middleware(RequestLoggingMiddleware)
+```
+
+#### Intercepting SQLAlchemy Logs
+
+To intercept SQLAlchemy logs with Loguru, you'll need an additional adapter:
+
+```python
+# app/core/logger_adapter.py
+import logging
+from loguru import logger
+
+class InterceptHandler(logging.Handler):
+    """
+    Intercepts standard logging messages and redirects them to Loguru.
+    Used for catching logs from libraries that use standard logging.
+    """
+    
+    def emit(self, record):
+        # Get corresponding Loguru level if it exists
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        
+        # Find caller from where the logged message originated
+        frame, depth = logging.currentframe(), 2
+        while frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
+
+def setup_standard_logging_intercept():
+    """Redirect standard logging to loguru"""
+    # Get all existing loggers
+    logging.basicConfig(handlers=[InterceptHandler()], level=0)
+    
+    # Replace all handlers with InterceptHandler for specific loggers
+    for name in logging.root.manager.loggerDict.keys():
+        if name.startswith(('sqlalchemy', 'uvicorn', 'gunicorn')):
+            logging.getLogger(name).handlers = [InterceptHandler()]
+```
+
+#### Update the setup_logging function
+
+```python
+# app/core/logger.py (modified setup_logging function)
+
+def setup_logging() -> None:
+    """Configure Loguru based on environment settings"""
+    # ... existing code ...
+    
+    # Intercept standard logging
+    from app.core.logger_adapter import setup_standard_logging_intercept
+    setup_standard_logging_intercept()
+    
+    # Make logger available globally
+    return logger
+```
+
+#### Using the Logger
+
+```python
+# Example usage in a service
+from app.core.logger import logger
+
+class UserService:
+    async def create_user(self, user_data):
+        try:
+            logger.info(
+                f"Creating new user",
+                username=user_data.username,
+                email=user_data.email
+            )
+            
+            # ... business logic ...
+            
+            logger.info(
+                f"User created successfully",
+                user_id=user.id,
+                username=user.username
+            )
+            return user
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to create user",
+                username=user_data.username,
+                error=str(e),
+                exc_info=True
+            )
+            raise
+```
+
+### Security Considerations
+
+```python
+# app/core/security.py
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from datetime import datetime, timedelta
+from app.core.config import settings
+import secrets
+import string
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against a hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Generate password hash."""
+    return pwd_context.hash(password)
+
+def generate_secure_token(length: int = 32) -> str:
+    """Generate cryptographically secure random token."""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+# JWT token handling
+def create_access_token(data: dict, expires_delta: timedelta = None) -> str:
+    """Create a new JWT token."""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (
+        expires_delta or 
+        timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    to_encode.update({"exp": expire})
+    
+    # Add jti (JWT ID) for token revocation capability
+    to_encode.update({"jti": generate_secure_token(16)})
+    
+    return jwt.encode(
+        to_encode, 
+        settings.SECRET_KEY, 
+        algorithm=settings.ALGORITHM
+    )
+
+def decode_token(token: str) -> dict:
+    """Decode and verify a JWT token."""
+    try:
+        payload = jwt.decode(
+            token, 
+            settings.SECRET_KEY, 
+            algorithms=[settings.ALGORITHM]
+        )
+        return payload
+    except JWTError:
+        return None
+```
+
+#### Security Middleware
+
+```python
+# app/middleware/security.py
+from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+    
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # Add security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        
+        return response
+
+def setup_security_middleware(app: FastAPI):
+    """Configure security middleware."""
+    app.add_middleware(SecurityHeadersMiddleware)
+```
+
+## Conclusion
+
+This document provides comprehensive guidelines for developing FastAPI applications using modern tools and best practices. By following these patterns and structures, you can build scalable, maintainable, and secure backend services that leverage the full power of FastAPI, SQLAlchemy, UV package management, and Docker.
+
+Remember that while these guidelines are designed to cover most use cases, your specific project requirements might necessitate adaptations. Always prioritize readability, maintainability, and security in your implementation decisions.
+
+For the latest updates and best practices, regularly consult the official documentation for FastAPI, SQLAlchemy, UV, and Docker, as these tools continue to evolve.
