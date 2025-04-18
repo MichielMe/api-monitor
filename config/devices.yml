@@ -12,56 +12,84 @@ devices:
   #     swagger_url: "http://host.docker.internal:8002/mock/router/swagger.json"
 
   # Example of a device using OpenID Connect authentication (Prismon)
-  - name: prismon-monitor
+  # - name: prismon-monitor
+  #   type: media_monitor
+  #   description: "Prismon media monitor"
+  #   api:
+  #     # Use the actual Prismon IP or hostname
+  #     base_url: "https://prismon-ip"
+  #     # Enable HTTPS certificate verification
+  #     verify_ssl: false
+  #     # Use token authentication with OpenID Connect extension
+  #     auth_type: token_from_auth
+  #     auth_type_extension: openid_connect
+  #     username: monitoring
+  #     password: ${PRISMON_PASSWORD}
+  #     # OpenID Connect token endpoint
+  #     auth_endpoint: "auth/realms/prismon/protocol/openid-connect/token"
+  #     auth_method: POST
+  #     # OpenID Connect specific settings
+  #     openid_client_id: webui
+  #     openid_scope: offline_access
+  #     # Define monitoring endpoints
+  #     endpoints:
+  #       - path: "/-/status"
+  #         method: GET
+  #         nested_json: true
+  #       - path: "/-/metrics"
+  #         method: GET
+  #         nested_json: true
+  #       - path: "/-/kpi"
+  #         method: GET
+  #         nested_json: true
+  #       - path: "/-/health"
+  #         method: GET
+  #         critical: true
+
+  # # Web Application - For web apps, we use the Prometheus metrics endpoint
+  # - name: checkmate
+  #   type: web_application
+  #   description: "CheckMate QC API"
+  #   api:
+  #     # Point to the user's locally running API
+  #     base_url: "http://host.docker.internal:8000"
+  #     auth_type: none
+  #     swagger_url: "http://host.docker.internal:8000/openapi.json"
+  #     metrics_type: prometheus
+  #     metrics_path: "/metrics"
+  #     # Only keep critical health check endpoints
+  #     endpoints:
+  #       - path: "/health"
+  #         method: GET
+  #         critical: true
+
+- name: prismon-monitor
     type: media_monitor
     description: "Prismon media monitor"
     api:
-      # Use the actual Prismon IP or hostname
-      base_url: "https://prismon-ip"
-      # Enable HTTPS certificate verification
+      base_url: "http://10.211.146.133"
       verify_ssl: false
-      # Use token authentication with OpenID Connect extension
       auth_type: token_from_auth
       auth_type_extension: openid_connect
-      username: monitoring
+      username: configuration
       password: ${PRISMON_PASSWORD}
-      # OpenID Connect token endpoint
       auth_endpoint: "auth/realms/prismon/protocol/openid-connect/token"
       auth_method: POST
-      # OpenID Connect specific settings
       openid_client_id: webui
       openid_scope: offline_access
-      # Define monitoring endpoints
       endpoints:
-        - path: "/-/status"
+        - path: "/-/r/spu.inputs"
           method: GET
           nested_json: true
-        - path: "/-/metrics"
+        - path: "/-/r/spu.outputs"
           method: GET
           nested_json: true
-        - path: "/-/kpi"
+        - path: "/-/r/spu.bmm"
           method: GET
           nested_json: true
-        - path: "/-/health"
+        - path: "/-/r/spu.sources"
           method: GET
-          critical: true
-
-  # Web Application - For web apps, we use the Prometheus metrics endpoint
-  - name: checkmate
-    type: web_application
-    description: "CheckMate QC API"
-    api:
-      # Point to the user's locally running API
-      base_url: "http://host.docker.internal:8000"
-      auth_type: none
-      swagger_url: "http://host.docker.internal:8000/openapi.json"
-      metrics_type: prometheus
-      metrics_path: "/metrics"
-      # Only keep critical health check endpoints
-      endpoints:
-        - path: "/health"
-          method: GET
-          critical: true
+          nested_json: true
 
 # Global configuration
 global:
